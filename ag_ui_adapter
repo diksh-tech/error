@@ -1,0 +1,247 @@
+import json
+import logging
+import asyncio
+from typing import Any, Dict, List, Optional, Union
+from datetime import datetime
+from uuid import uuid4
+from rx.subject import Subject
+from rx import Observable
+
+from client import FlightOpsMCPClient
+
+logger = logging.getLogger("flightops.agui.adapter")
+
+class AGUIEvent:
+    """Base class for AG-UI protocol events"""
+    def __init__(self, type: str, **kwargs):
+        self.type = type
+        self.__dict__.update(kwargs)
+
+    def json(self) -> str:
+        """Serialize event to JSON string"""
+        return json.dumps(self.__dict__, default=str)
+
+
+class FlightOpsMCPAdapter:
+    """Adapter that converts MCP client operations to AG-UI protocol events"""
+
+    def __init__(self):
+        self.mcp_client = FlightOpsMCPClient()
+        self._message_counter = 0
+        self._tool_counter = 0
+
+    def _next_message_id(self) -> str:
+        """Generate unique message IDs"""
+        self._message_counter += 1
+        return f"msg_{datetime.utcnow().isoformat()}_{self._message_counter}"
+
+    def _next_tool_id(self) -> str:
+        """Generate unique tool call IDs"""
+        self._tool_counter += 1
+        return f"tool_{datetime.utcnow().isoformat()}_{self._tool_counter}"
+
+    def _create_text_event(self, content: str, message_id: Optional[str] = None,
+                          parent_message_id: Optional[str] = None) -> AGUIEvent:
+        """Create a text message event"""
+        return AGUIEvent(
+            type="TEXT_MESSAGE",
+            messageId=message_id or self._next_message_id(),
+            parentMessageId=parent_message_id,
+            role="assistant",
+            content=content
+        )
+
+    def _create_text_chunk_event(self, delta: str, message_id: str) -> AGUIEvent:
+        """Create a text chunk event for streaming"""
+        return AGUIEvent(
+            type="TEXT_MESSAGE_CHUNK",
+            messageId=message_id,
+            delta=delta
+        )
+
+    def _create_tool_events(self, tool_name: str, args: Dict[str, Any],
+                           parent_message_id: Optional[str] = None) -> List[AGUIEvent]:
+        """Create tool call start/args/end events sequence"""
+        tool_id = self._next_tool_id()
+        events = []
+
+        # Tool call start
+        events.append(AGUIEvent(
+            type="TOOL_CALL_START",
+            toolCallId=tool_id,
+            toolCallName=tool_name,
+            parentMessageId=parent_message_id
+        ))
+
+        # Tool call args (chunked if large)
+        args_json = json.dumps(args)
+        chunk_size = 1000  # Adjust based on your needs
+        if len(args_json) > chunk_size:
+            chunks = [args_json[i:i + chunk_size] 
+                     for i in range(0, len(args_json), chunk_size)]
+            for chunk in chunks:
+                events.append(AGUIEvent(
+                    type="TOOL_CALL_ARGS",
+                    toolCallId=tool_id,
+                    delta=chunk
+                ))
+        else:
+            events.append(AGUIEvent(
+                type="TOOL_CALL_ARGS",
+                toolCallId=tool_id,
+                delta=args_json
+            ))
+
+        # Tool call end
+        events.append(AGUIEvent(
+            type="TOOL_CALL_END",
+            toolCallId=tool_id
+        ))
+
+        return events, tool_id
+
+    def _create_tool_result_event(self, result: Any, tool_id: str,
+                                parent_message_id: Optional[str] = None) -> AGUIEvent:
+        """Create a tool result message event"""
+        return AGUIEvent(
+            type="TOOL_RESULT",
+            messageId=self._next_message_id(),
+            parentMessageId=parent_message_id,
+            toolCallId=tool_id,
+            content=json.dumps(result) if isinstance(result, (dict, list)) else str(result)
+        )
+
+    async def _execute_tool(self, tool_name: str, args: Dict[str, Any],
+                          parent_message_id: Optional[str] = None) -> List[AGUIEvent]:
+        """Execute a tool and generate appropriate events"""
+        events = []
+        
+        # Create and add tool call events
+        tool_events, tool_id = self._create_tool_events(
+            tool_name, args, parent_message_id
+        )
+        events.extend(tool_events)
+
+        try:
+            # Execute tool via MCP client
+            result = await self.mcp_client.invoke_tool(tool_name, args)
+            
+            # Add tool result
+            events.append(
+                self._create_tool_result_event(result, tool_id, parent_message_id)
+            )
+
+        except Exception as e:
+            logger.error(f"Error executing tool {tool_name}: {e}")
+            # Add error result
+            events.append(
+                self._create_tool_result_event(
+                    {"error": str(e)}, tool_id, parent_message_id
+                )
+            )
+
+        return events
+
+    async def _process_input(self, input_obj: Dict[str, Any]) -> Observable:
+        """
+        Process AG-UI input and return an Observable of events.
+        
+        The input_obj should have:
+        - thread_id: string
+        - run_id: string
+        - messages: list of message objects with role/content
+        """
+        subject = Subject()
+        
+        async def process():
+            try:
+                # Get the user's last message
+                user_messages = [m for m in input_obj.get("messages", [])
+                               if m.get("role") == "user"]
+                if not user_messages:
+                    raise ValueError("No user message found in input")
+                
+                user_query = user_messages[-1].get("content", "").strip()
+                if not user_query:
+                    raise ValueError("Empty user query")
+
+                # Initial thinking message
+                thinking_id = self._next_message_id()
+                subject.on_next(self._create_text_event(
+                    "Let me help you with that...",
+                    message_id=thinking_id
+                ))
+
+                # Plan and execute tools via MCP client
+                response = await self.mcp_client.run_query(user_query)
+                
+                if "error" in response:
+                    subject.on_next(self._create_text_event(
+                        f"Sorry, I encountered an error: {response['error']}",
+                        parent_message_id=thinking_id
+                    ))
+                    return
+
+                # Execute each tool in the plan
+                for step in response.get("plan", []):
+                    tool_name = step.get("tool")
+                    args = step.get("arguments", {})
+                    
+                    tool_events = await self._execute_tool(
+                        tool_name, args, thinking_id
+                    )
+                    for event in tool_events:
+                        subject.on_next(event)
+
+                # Stream the final summary as chunks
+                summary = response.get("summary", {}).get("summary", "")
+                if summary:
+                    summary_id = self._next_message_id()
+                    chunk_size = 100  # Adjust based on your needs
+                    chunks = [summary[i:i + chunk_size]
+                            for i in range(0, len(summary), chunk_size)]
+                    
+                    for chunk in chunks:
+                        subject.on_next(self._create_text_chunk_event(
+                            chunk, summary_id
+                        ))
+
+            except Exception as e:
+                logger.exception("Error processing input")
+                subject.on_next(self._create_text_event(
+                    f"I apologize, but I encountered an error: {str(e)}",
+                    parent_message_id=thinking_id
+                ))
+            finally:
+                subject.on_completed()
+
+        # Start processing in the background
+        asyncio.create_task(process())
+        return subject
+
+    def run(self, input_obj: Dict[str, Any]) -> Observable:
+        """
+        Main entry point - converts an AG-UI protocol input into an Observable
+        stream of AG-UI protocol events.
+
+        Args:
+            input_obj: Dict containing thread_id, run_id, and messages list
+
+        Returns:
+            Observable that emits AGUIEvent objects
+        """
+        # Validate minimal input structure
+        if not isinstance(input_obj, dict):
+            raise ValueError("Input must be a dictionary")
+        
+        if "messages" not in input_obj:
+            raise ValueError("Input must contain 'messages' list")
+
+        # Ensure we have a thread_id and run_id
+        if "thread_id" not in input_obj:
+            input_obj["thread_id"] = f"thread_{uuid4()}"
+        if "run_id" not in input_obj:
+            input_obj["run_id"] = f"run_{uuid4()}"
+
+        Process the input and return the Observable
+        return Observable.from_(self._process_input(input_obj))
